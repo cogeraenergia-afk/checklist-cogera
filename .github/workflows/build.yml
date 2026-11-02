@@ -1,0 +1,108 @@
+# Coloque este arquivo no repositório em:  .github/workflows/build.yml
+# Toda vez que você subir um .zip (ou alterar o API_URL.txt), ele:
+#   1) descompacta o .zip mais recente
+#   2) lê a URL da API do API_URL.txt e grava o config.js do app
+#   3) compila o APK Android (sempre com a mesma chave: instala por cima)
+#   4) publica o app, o convite e o app.apk no GitHub Pages
+name: Publicar app
+
+on:
+  push:
+    paths:
+      - '**.zip'
+      - 'API_URL.txt'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Baixar repositório
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Descompactar o .zip mais recente
+        run: |
+          ZIP=$(git log -1 --name-only --pretty=format: -- '*.zip' '*.ZIP' | grep -i '\.zip$' | head -1 || true)
+          if [ -z "$ZIP" ] || [ ! -f "$ZIP" ]; then ZIP=$(ls -1t *.zip 2>/dev/null | head -1 || true); fi
+          if [ -z "$ZIP" ]; then echo "::error::Nenhum arquivo .zip encontrado no repositório."; exit 1; fi
+          echo "Usando: $ZIP"
+          rm -rf work && mkdir work && unzip -q "$ZIP" -d work
+          IDX=$(find work -path '*/site/index.html' -not -path '*/__MACOSX/*' | head -1)
+          if [ -z "$IDX" ]; then echo "::error::O .zip não tem a pasta site/index.html."; exit 1; fi
+          ROOT=$(dirname "$(dirname "$IDX")")
+          echo "ROOT=$ROOT" >> $GITHUB_ENV
+
+      - name: Ler URL da API e endereço do app
+        run: |
+          if [ -f API_URL.txt ] && grep -q 'http' API_URL.txt; then F=API_URL.txt; else F="$ROOT/API_URL.txt"; fi
+          API=$(sed 's/^\xEF\xBB\xBF//' "$F" | tr -d '\r\n\t ' )
+          if ! echo "$API" | grep -q '^https://script.google.com/'; then
+            echo "::error::API_URL.txt deve conter a URL do Apps Script (https://script.google.com/.../exec). Lido: '$API'"; exit 1
+          fi
+          OWNER="${GITHUB_REPOSITORY_OWNER,,}"
+          REPO="${GITHUB_REPOSITORY#*/}"
+          if [ "${REPO,,}" = "$OWNER.github.io" ]; then APP_URL="https://$OWNER.github.io/"; else APP_URL="https://$OWNER.github.io/$REPO/"; fi
+          echo "window.API_URL = '$API';" > "$ROOT/site/config.js"
+          echo "APP_URL=$APP_URL" >> $GITHUB_ENV
+          echo "App: $APP_URL"
+
+      - name: Preparar Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Preparar Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Compilar APK
+        env:
+          KS_B64: ${{ secrets.KEYSTORE_B64 }}
+          KS_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.KEYSTORE_ALIAS }}
+        run: |
+          cd "$ROOT/android"
+          # (opcional) chave guardada em Secrets do GitHub tem prioridade sobre a do .zip
+          if [ -n "$KS_B64" ]; then echo "$KS_B64" | base64 -d > /tmp/release.jks; export KS_FILE=/tmp/release.jks; else unset KS_PASSWORD KS_ALIAS; fi
+          gradle assembleRelease --no-daemon -PappUrl="$APP_URL" -PversionCode=${{ github.run_number }}
+          cp app/build/outputs/apk/release/app-release.apk "$GITHUB_WORKSPACE/$ROOT/site/app.apk"
+          ls -la "$GITHUB_WORKSPACE/$ROOT/site"
+
+      - name: Guardar APK (download pela aba Actions)
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-apk
+          path: ${{ env.ROOT }}/site/app.apk
+
+      - name: Configurar Pages
+        uses: actions/configure-pages@v5
+
+      - name: Enviar site
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ${{ env.ROOT }}/site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - name: Publicar no GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@v4
